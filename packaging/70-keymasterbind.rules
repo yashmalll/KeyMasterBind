@@ -1,0 +1,3 @@
+# Dedicated group: only this keyboard's event nodes and uinput.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="30fa", ATTRS{idProduct}=="2350", GROUP="keymasterbind", MODE="0660"
+SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="keymasterbind", MODE="0660", OPTIONS+="static_node=uinput"

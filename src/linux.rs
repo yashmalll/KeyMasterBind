@@ -1,13 +1,156 @@
-use std::{fs::{self,File,OpenOptions},io::{self,Read,Write},os::{fd::AsRawFd,unix::fs::OpenOptionsExt},mem::size_of};
-unsafe extern "C" {fn ioctl(fd:i32,request:usize,...)->i32;}
-#[repr(C)]#[derive(Clone,Copy,Default)]pub struct Event{pub sec:isize,pub usec:isize,pub kind:u16,pub code:u16,pub value:i32}
-#[repr(C)]#[derive(Default)]struct Id{bus:u16,vendor:u16,product:u16,version:u16}
-#[repr(C)]struct Setup{id:Id,name:[u8;80],ff:u32}
-fn ctl(file:&File,req:usize,arg:usize)->io::Result<()>{if unsafe{ioctl(file.as_raw_fd(),req,arg)}<0{Err(io::Error::last_os_error())}else{Ok(())}}
-pub fn devices()->Vec<(String,String)>{let mut out=Vec::new();if let Ok(entries)=fs::read_dir("/sys/class/input"){for e in entries.flatten(){let n=e.file_name().to_string_lossy().into_owned();if !n.starts_with("event"){continue}let p=e.path().join("device");let vendor=fs::read_to_string(p.join("id/vendor")).unwrap_or_default();let product=fs::read_to_string(p.join("id/product")).unwrap_or_default();if vendor.trim()=="30fa"&&product.trim()=="2350"{out.push((format!("/dev/input/{n}"),fs::read_to_string(p.join("name")).unwrap_or_default().trim().into()))}}}out.sort();out}
-pub struct Input{file:File,grabbed:bool}
-impl Input{pub fn open(path:&str)->io::Result<Self>{Ok(Self{file:OpenOptions::new().read(true).custom_flags(0x800).open(path)?,grabbed:false})}pub fn grab(&mut self,on:bool)->io::Result<()>{ctl(&self.file,0x40044590,on as usize)?;self.grabbed=on;Ok(())}pub fn read(&mut self)->io::Result<Option<Event>>{let mut e=Event::default();let bytes=unsafe{std::slice::from_raw_parts_mut((&mut e as *mut Event).cast::<u8>(),size_of::<Event>())};match self.file.read(bytes){Ok(n) if n==size_of::<Event>()=>Ok(Some(e)),Ok(0)=>Err(io::Error::new(io::ErrorKind::UnexpectedEof,"Устройство отключено")),Ok(_)=>Err(io::Error::other("Неполное input_event")),Err(e) if e.kind()==io::ErrorKind::WouldBlock=>Ok(None),Err(e)=>Err(e)}}}
-impl Drop for Input{fn drop(&mut self){if self.grabbed{let _=self.grab(false);}}}
-pub struct Output{file:File}
-impl Output{pub fn new()->io::Result<Self>{let file=OpenOptions::new().write(true).open("/dev/uinput")?;ctl(&file,0x40045564,1)?;for key in 1..=767{ctl(&file,0x40045565,key)?}let mut setup=Setup{id:Id{bus:3,vendor:0x1209,product:1,version:1},name:[0;80],ff:0};let name=b"KeyMasterBind virtual keyboard";setup.name[..name.len()].copy_from_slice(name);ctl(&file,0x405c5503,(&setup as *const Setup) as usize)?;ctl(&file,0x5501,0)?;Ok(Self{file})}pub fn key(&mut self,code:u16,value:i32)->io::Result<()>{for e in [Event{kind:1,code,value,..Event::default()},Event::default()]{let bytes=unsafe{std::slice::from_raw_parts((&e as *const Event).cast::<u8>(),size_of::<Event>())};self.file.write_all(bytes)?}Ok(())}}
-impl Drop for Output{fn drop(&mut self){let _=ctl(&self.file,0x5502,0);}}
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    mem::size_of,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+};
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: usize, ...) -> i32;
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Event {
+    pub sec: isize,
+    pub usec: isize,
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct Id {
+    bus: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+#[repr(C)]
+struct Setup {
+    id: Id,
+    name: [u8; 80],
+    ff: u32,
+}
+fn ctl(file: &File, req: usize, arg: usize) -> io::Result<()> {
+    if unsafe { ioctl(file.as_raw_fd(), req, arg) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+pub fn devices() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/input") {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if !n.starts_with("event") {
+                continue;
+            }
+            let p = e.path().join("device");
+            let vendor = fs::read_to_string(p.join("id/vendor")).unwrap_or_default();
+            let product = fs::read_to_string(p.join("id/product")).unwrap_or_default();
+            if vendor.trim() == "30fa" && product.trim() == "2350" {
+                out.push((
+                    format!("/dev/input/{n}"),
+                    fs::read_to_string(p.join("name"))
+                        .unwrap_or_default()
+                        .trim()
+                        .into(),
+                ))
+            }
+        }
+    }
+    out.sort();
+    out
+}
+pub struct Input {
+    file: File,
+    grabbed: bool,
+}
+impl Input {
+    pub fn open(path: &str) -> io::Result<Self> {
+        Ok(Self {
+            file: OpenOptions::new()
+                .read(true)
+                .custom_flags(0x800)
+                .open(path)?,
+            grabbed: false,
+        })
+    }
+    pub fn grab(&mut self, on: bool) -> io::Result<()> {
+        ctl(&self.file, 0x40044590, on as usize)?;
+        self.grabbed = on;
+        Ok(())
+    }
+    pub fn read(&mut self) -> io::Result<Option<Event>> {
+        let mut e = Event::default();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&mut e as *mut Event).cast::<u8>(), size_of::<Event>())
+        };
+        match self.file.read(bytes) {
+            Ok(n) if n == size_of::<Event>() => Ok(Some(e)),
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Устройство отключено",
+            )),
+            Ok(_) => Err(io::Error::other("Неполное input_event")),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+impl Drop for Input {
+    fn drop(&mut self) {
+        if self.grabbed {
+            let _ = self.grab(false);
+        }
+    }
+}
+pub struct Output {
+    file: File,
+}
+impl Output {
+    pub fn new() -> io::Result<Self> {
+        let file = OpenOptions::new().write(true).open("/dev/uinput")?;
+        ctl(&file, 0x40045564, 1)?;
+        for key in 1..=767 {
+            ctl(&file, 0x40045565, key)?
+        }
+        let mut setup = Setup {
+            id: Id {
+                bus: 3,
+                vendor: 0x1209,
+                product: 1,
+                version: 1,
+            },
+            name: [0; 80],
+            ff: 0,
+        };
+        let name = b"KeyMasterBind virtual keyboard";
+        setup.name[..name.len()].copy_from_slice(name);
+        ctl(&file, 0x405c5503, (&setup as *const Setup) as usize)?;
+        ctl(&file, 0x5501, 0)?;
+        Ok(Self { file })
+    }
+    pub fn key(&mut self, code: u16, value: i32) -> io::Result<()> {
+        for e in [
+            Event {
+                kind: 1,
+                code,
+                value,
+                ..Event::default()
+            },
+            Event::default(),
+        ] {
+            let bytes = unsafe {
+                std::slice::from_raw_parts((&e as *const Event).cast::<u8>(), size_of::<Event>())
+            };
+            self.file.write_all(bytes)?
+        }
+        Ok(())
+    }
+}
+impl Drop for Output {
+    fn drop(&mut self) {
+        let _ = ctl(&self.file, 0x5502, 0);
+    }
+}
