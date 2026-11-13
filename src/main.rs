@@ -5,15 +5,19 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 const DEFAULT: &str = r#"{"active":"Основной","profiles":[{"name":"Основной","bindings":{}}]}"#;
 struct State {
     config: Json,
+    config_path: PathBuf,
     running: bool,
+    auto_connect: bool,
+    learning: bool,
     device: String,
     error: String,
     last_key: u16,
@@ -21,6 +25,7 @@ struct State {
 }
 enum Command {
     Start(String),
+    Auto,
     Stop,
 }
 fn validate(c: &Json) -> Result<(), String> {
@@ -43,6 +48,21 @@ fn validate(c: &Json) -> Result<(), String> {
                     .any(|n| !matches!(n, Json::Num(1..=767)) || !seen.insert(n.num()))
             {
                 return Err("Раскладка должна содержать 19 разных кодов от 1 до 767".into());
+            }
+        }
+        if !matches!(p.get("wheel"), Json::Null) {
+            let wheel = p.get("wheel").arr();
+            let mut seen = HashSet::new();
+            if wheel.len() != 3
+                || wheel.iter().any(|n| match n {
+                    Json::Null => false,
+                    Json::Num(1..=767) => {
+                        !seen.insert(n.num()) || p.get("layout").arr().iter().any(|k| k == n)
+                    }
+                    _ => true,
+                })
+            {
+                return Err("Колёсико: три кода (1–767) или null, без повторов".into());
             }
         }
         let Json::Obj(bindings) = p.get("bindings") else {
@@ -113,8 +133,23 @@ fn worker(state: Arc<Mutex<State>>, rx: mpsc::Receiver<Command>) {
     let mut output: Option<linux::Output> = None;
     let mut held: HashMap<u16, Vec<u16>> = HashMap::new();
     let mut counts: HashMap<u16, usize> = HashMap::new();
+    let mut next_scan = Instant::now();
     loop {
-        if let Ok(command) = rx.try_recv() {
+        let command = rx.try_recv().ok().or_else(|| {
+            if input.is_none() && Instant::now() >= next_scan && state.lock().unwrap().auto_connect
+            {
+                next_scan = Instant::now() + Duration::from_secs(2);
+                return linux::preferred_device(&linux::devices()).map(Command::Start);
+            }
+            None
+        });
+        if let Some(command) = command {
+            let command = match command {
+                Command::Auto => {
+                    Command::Start(linux::preferred_device(&linux::devices()).unwrap_or_default())
+                }
+                command => command,
+            };
             if let Some(o) = output.as_mut() {
                 for k in counts.keys() {
                     let _ = o.key(*k, 0);
@@ -126,17 +161,26 @@ fn worker(state: Arc<Mutex<State>>, rx: mpsc::Receiver<Command>) {
             output = None;
             let mut s = state.lock().unwrap();
             s.running = false;
+            s.learning = false;
             s.device.clear();
             s.error.clear();
+            s.auto_connect = !matches!(command, Command::Stop);
+            next_scan = Instant::now() + Duration::from_secs(2);
             if let Command::Start(path) = command {
+                if path.is_empty() {
+                    continue;
+                }
                 let result = (|| {
                     if !linux::devices().iter().any(|(p, _)| p == &path) {
                         return Err(std::io::Error::other(
                             "Разрешена только клавиатура 30fa:2350",
                         ));
                     }
+                    if let Some(error) = linux::access_error(&path) {
+                        return Err(std::io::Error::other(error));
+                    }
                     let mut i = linux::Input::open(&path)?;
-                    let o = linux::Output::new()?;
+                    let o = linux::Output::new().map_err(|e| std::io::Error::other(format!("Не удалось создать виртуальную клавиатуру через /dev/uinput: {e}. Проверьте загрузку модуля uinput и права по README.")))?;
                     i.grab(true)?;
                     Ok((i, o))
                 })();
@@ -170,6 +214,11 @@ fn worker(state: Arc<Mutex<State>>, rx: mpsc::Receiver<Command>) {
                         let mut s = state.lock().unwrap();
                         s.last_key = e.code;
                         s.sequence += 1;
+                        if s.learning {
+                            s.learning = false;
+                            held.insert(e.code, vec![]);
+                            continue;
+                        }
                         let p = s
                             .config
                             .get("profiles")
@@ -225,12 +274,11 @@ fn worker(state: Arc<Mutex<State>>, rx: mpsc::Receiver<Command>) {
                             }
                         }
                     }
-                } else if e.value == 2 {
-                    if let Some(ks) = held.get(&e.code) {
-                        if let Some(k) = ks.last() {
-                            o.key(*k, 2)?
-                        }
-                    }
+                } else if e.value == 2
+                    && let Some(ks) = held.get(&e.code)
+                    && let Some(k) = ks.last()
+                {
+                    o.key(*k, 2)?
                 }
             }
             Ok(())
@@ -247,20 +295,20 @@ fn worker(state: Arc<Mutex<State>>, rx: mpsc::Receiver<Command>) {
             counts.clear();
             let mut s = state.lock().unwrap();
             s.running = false;
+            s.learning = false;
             s.error = e.to_string();
         }
         thread::sleep(Duration::from_millis(5));
     }
 }
-fn response(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
+fn response(stream: &mut impl Write, status: &str, ctype: &str, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n{body}",
         body.len()
     );
 }
-fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>, tx: mpsc::Sender<Command>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+fn serve(mut stream: impl Read + Write, state: Arc<Mutex<State>>, tx: mpsc::Sender<Command>) {
     let mut data = Vec::new();
     let end = loop {
         let mut b = [0; 4096];
@@ -342,7 +390,7 @@ fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>, tx: mpsc::Sender<Comma
                 "text/html; charset=utf-8",
                 include_str!("../web/index.html"),
             );
-            return Ok(String::new());
+            Ok(String::new())
         }
         ("GET", "/app.js") => {
             response(
@@ -351,7 +399,7 @@ fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>, tx: mpsc::Sender<Comma
                 "text/javascript; charset=utf-8",
                 include_str!("../web/app.js"),
             );
-            return Ok(String::new());
+            Ok(String::new())
         }
         ("GET", "/style.css") => {
             response(
@@ -360,38 +408,68 @@ fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>, tx: mpsc::Sender<Comma
                 "text/css",
                 include_str!("../web/style.css"),
             );
-            return Ok(String::new());
+            Ok(String::new())
         }
         ("GET", "/api/config") => Ok(state.lock().unwrap().config.encode()),
         ("GET", "/api/status") => {
             let s = state.lock().unwrap();
-            let devices = linux::devices()
+            let found = linux::devices();
+            let detection_message = linux::detection_message(&found);
+            let devices = found
                 .iter()
-                .map(|(p, n)| format!("{{\"path\":{},\"name\":{}}}", quote(p), quote(n)))
+                .map(|(p, n)| {
+                    let error = linux::access_error(p);
+                    format!(
+                        "{{\"path\":{},\"name\":{},\"readable\":{},\"access_error\":{}}}",
+                        quote(p),
+                        quote(n),
+                        error.is_none(),
+                        quote(error.as_deref().unwrap_or(""))
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             Ok(format!(
-                "{{\"running\":{},\"device\":{},\"error\":{},\"last_key\":{},\"sequence\":{},\"devices\":[{}],\"firmware_supported\":false}}",
+                "{{\"auto_connect\":{},\"preferred_device\":{},\"running\":{},\"device\":{},\"error\":{},\"last_key\":{},\"sequence\":{},\"devices\":[{}],\"detection_message\":{},\"firmware_supported\":false}}",
+                s.auto_connect,
+                quote(&linux::preferred_device(&found).unwrap_or_default()),
                 s.running,
                 quote(&s.device),
                 quote(&s.error),
                 s.last_key,
                 s.sequence,
-                devices
+                devices,
+                quote(&detection_message)
             ))
         }
         ("POST", "/api/config") => {
             let c = parse(&body)?;
             validate(&c)?;
-            fs::write("config.json.tmp", c.encode()).map_err(|e| e.to_string())?;
-            fs::rename("config.json.tmp", "config.json").map_err(|e| e.to_string())?;
-            state.lock().unwrap().config = c;
+            let mut s = state.lock().unwrap();
+            let temp = s.config_path.with_extension("json.tmp");
+            fs::write(&temp, c.encode()).map_err(|e| e.to_string())?;
+            fs::rename(&temp, &s.config_path).map_err(|e| e.to_string())?;
+            s.config = c;
             Ok("{\"ok\":true}".into())
         }
         ("POST", "/api/start") => {
             let c = parse(&body)?;
             tx.send(Command::Start(c.get("device").str().into()))
                 .map_err(|e| e.to_string())?;
+            Ok("{\"ok\":true}".into())
+        }
+        ("POST", "/api/learn") => {
+            let body = parse(&body)?;
+            let mut s = state.lock().unwrap();
+            let enabled = body.get("enabled") == &Json::Bool(true);
+            if enabled && !s.running {
+                return Err("Сначала включите перехват".into());
+            }
+            s.learning = enabled;
+            Ok("{\"ok\":true}".into())
+        }
+        ("POST", "/api/auto") => {
+            tx.send(Command::Auto).map_err(|e| e.to_string())?;
             Ok("{\"ok\":true}".into())
         }
         ("POST", "/api/stop") => {
@@ -414,6 +492,25 @@ fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>, tx: mpsc::Sender<Comma
     }
 }
 fn main() {
+    if std::env::args().any(|a| a == "--diagnose") {
+        let devices = linux::devices();
+        println!("{}", linux::detection_message(&devices));
+        for (path, name) in &devices {
+            println!(
+                "{path} · {name} · {}",
+                linux::access_error(path).unwrap_or_else(|| "доступно для чтения".into())
+            );
+        }
+        println!(
+            "/dev/uinput: {}",
+            if std::path::Path::new("/dev/uinput").exists() {
+                "существует"
+            } else {
+                "отсутствует"
+            }
+        );
+        return;
+    }
     let config = match fs::read_to_string("config.json") {
         Ok(s) => match parse(&s).and_then(|c| {
             validate(&c)?;
@@ -433,7 +530,10 @@ fn main() {
     };
     let state = Arc::new(Mutex::new(State {
         config,
+        config_path: PathBuf::from("config.json"),
         running: false,
+        auto_connect: !std::env::args().any(|a| a == "--no-auto"),
+        learning: false,
         device: String::new(),
         error: String::new(),
         last_key: 0,
@@ -442,9 +542,14 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let s = state.clone();
     thread::spawn(move || worker(s, rx));
-    let listener = TcpListener::bind("127.0.0.1:8765").expect("Порт 8765 занят");
+    let listener = TcpListener::bind("127.0.0.1:8765").unwrap_or_else(|e| {
+        eprintln!("Не удалось открыть 127.0.0.1:8765: {e}");
+        std::process::exit(1)
+    });
     println!("KeyMasterBind → http://127.0.0.1:8765");
     for stream in listener.incoming().flatten() {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
         serve(stream, state.clone(), tx.clone());
     }
 }
@@ -460,5 +565,142 @@ mod tests {
     fn macro_limit() {
         let c=parse(r#"{"active":"a","profiles":[{"name":"a","bindings":{"1":{"kind":"macro","steps":[{"keys":[29,46],"delay":2001}]}}}]}"#).unwrap();
         assert!(validate(&c).is_err());
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::io::{self, Cursor};
+    struct Memory {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Memory {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.input.read(b)
+        }
+    }
+    impl Write for Memory {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn request(
+        s: &Arc<Mutex<State>>,
+        tx: &mpsc::Sender<Command>,
+        method: &str,
+        path: &str,
+        headers: &str,
+        body: &str,
+    ) -> String {
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        );
+        let mut stream = Memory {
+            input: Cursor::new(req.into_bytes()),
+            output: vec![],
+        };
+        serve(&mut stream, s.clone(), tx.clone());
+        String::from_utf8(stream.output).unwrap()
+    }
+    #[test]
+    fn routes_persistence_and_request_guards() {
+        let dir =
+            std::env::temp_dir().join(format!("keymasterbind-rust-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let s = Arc::new(Mutex::new(State {
+            config: parse(DEFAULT).unwrap(),
+            config_path: path.clone(),
+            running: false,
+            auto_connect: true,
+            learning: false,
+            device: String::new(),
+            error: String::new(),
+            last_key: 0,
+            sequence: 0,
+        }));
+        let (tx, rx) = mpsc::channel();
+        for route in ["/", "/app.js", "/style.css", "/api/config", "/api/status"] {
+            assert!(
+                request(&s, &tx, "GET", route, "", "").starts_with("HTTP/1.1 200"),
+                "{route}"
+            );
+        }
+        let content = "Content-Type: application/json\r\n";
+        assert!(
+            request(&s, &tx, "POST", "/api/config", content, DEFAULT).starts_with("HTTP/1.1 200")
+        );
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap()).unwrap(),
+            parse(DEFAULT).unwrap()
+        );
+        for invalid in [
+            "{",
+            r#"{"active":"a","profiles":[]}"#,
+            r#"{"active":"a","profiles":[{"name":"a","layout":[1,1],"bindings":{}}]}"#,
+        ] {
+            assert!(
+                request(&s, &tx, "POST", "/api/config", content, invalid)
+                    .starts_with("HTTP/1.1 400")
+            );
+        }
+        assert!(
+            request(
+                &s,
+                &tx,
+                "POST",
+                "/api/config",
+                "Content-Type: text/plain\r\n",
+                DEFAULT
+            )
+            .starts_with("HTTP/1.1 415")
+        );
+        assert!(
+            request(
+                &s,
+                &tx,
+                "POST",
+                "/api/config",
+                "Content-Type: application/json\r\nOrigin: https://example.com\r\n",
+                DEFAULT
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+        assert!(
+            request(
+                &s,
+                &tx,
+                "GET",
+                "/api/status",
+                "Host: attacker.invalid\r\n",
+                ""
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+        assert!(
+            request(
+                &s,
+                &tx,
+                "POST",
+                "/api/learn",
+                content,
+                r#"{"enabled":true}"#
+            )
+            .starts_with("HTTP/1.1 400")
+        );
+        assert!(request(&s, &tx, "POST", "/api/stop", content, "{}").starts_with("HTTP/1.1 200"));
+        assert!(matches!(rx.try_recv(), Ok(Command::Stop)));
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap()).unwrap(),
+            parse(DEFAULT).unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
